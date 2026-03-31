@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from traceback import print_exc
-from typing import Any, Tuple, Dict, Generic, List, Optional
+from typing import Any, Tuple, Dict, Generic, List, Optional, Union
 
 import numpy as np
 from rlbot import flat
@@ -39,6 +39,8 @@ from .util import create_base_state
 
 AgentID = int
 
+USUAL_COUNTDOWN_LENGTH_TICKS = 480
+
 
 class MissedActionRecoveryStyle(Enum):
     RESET = 0
@@ -52,12 +54,16 @@ class MissedStepTickRecoveryStyle(Enum):
 
 @dataclass
 class RLGymBotConfig:
-    action_step_idx_used_to_build_game_state_for_env_step = -2
-    above_240_fps_mode = False
-    missed_action_recovery_style = MissedActionRecoveryStyle.RESET
-    missed_step_tick_recovery_style = MissedStepTickRecoveryStyle.RESET
-    standard_map = True
-    sim_extra_info = False
+    action_step_idx_used_to_build_game_state_for_env_step: int = -2
+    above_240_fps_mode: bool = False
+    missed_action_recovery_style: MissedActionRecoveryStyle = (
+        MissedActionRecoveryStyle.RESET
+    )
+    missed_step_tick_recovery_style: MissedStepTickRecoveryStyle = (
+        MissedStepTickRecoveryStyle.RESET
+    )
+    standard_map: bool = True
+    sim_extra_info: bool = False
 
 
 class RLGymBot(Generic[ActionType, ObsType, RewardType]):
@@ -116,13 +122,6 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         default_agent_id: Optional[str] = None,
         config=RLGymBotConfig(),
     ):
-        # Sort term, we have no above 240 fps mode implementation and no implementation of action_step_idx_used_to_build_game_state_for_env_step == -1, so let's assert that these aren't set.
-        assert (
-            not config.above_240_fps_mode
-        ), "above_240_fps_mode is not implemented yet!"
-        assert (
-            config.action_step_idx_used_to_build_game_state_for_env_step != -1
-        ), "action_step_idx_used_to_build_game_state_for_env_step == -1 is not implemented yet!"
         # Long term, the below assertion is what we will use. It doesn't hurt to leave it uncommented along with the above.
         assert (
             config.action_step_idx_used_to_build_game_state_for_env_step != -1
@@ -147,10 +146,14 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         )
         self._just_handled_countdown_packet = False
         self._match_first_countdown = True
+        self._match_first_kickoff = True
         self._last_packet = None
         self._first_countdown_tick = 0
+        self._set_first_action = False
+        self._early_countdown_finish_adjustment_possible = True
         self._last_env_action_start_tick = 0
         self._last_sent_action_tick = 0
+        self._last_sent_action = flat.ControllerState()
         self._unused_packets: List[flat.GamePacket] = []
         self._hist_game_states_and_packets: Dict[
             int, Tuple[GameState, flat.GamePacket]
@@ -223,6 +226,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
             exit()
 
         self._initialized_bot = True
+
         self._game_interface.send_msg(flat.InitComplete())
 
     def _handle_match_config(self, match_config: flat.MatchConfiguration):
@@ -252,48 +256,66 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
     # Update self._future_tick_action_map. The map defines actions where the action self._future_tick_action_map[i] is taken between packets with
     # frame_num i+1 and i+2 if not self.config.above_240_fps_mode and i and i+1 otherwise, i.e., i is when the action is submitted, not when the action is used
     def _update_future_tick_action_map(
-        self, packet: flat.GamePacket, obs: Dict[int, ObsType], start_tick: int
+        self,
+        packet: flat.GamePacket,
+        game_state: GameState,
+        obs: Dict[int, ObsType],
+        start_tick: int,
+        clear_hist=True,
     ):
-        self._future_tick_action_map = {
-            tick: action
-            for (tick, action) in self._future_tick_action_map.items()
-            if tick >= self._last_env_action_start_tick
-        }
-        action = self.get_action(obs[self.player_id], packet)
-        engine_action = self.action_parser.parse_actions(
-            {self.player_id: action}, self.latest_game_state, self.shared_info
-        )[self.player_id]
-        steps = engine_action.shape[0]
-        self._last_engine_action_length = steps
-        for idx in range(steps):
-            (
-                throttle,
-                steer,
-                pitch,
-                yaw,
-                roll,
-                jump_float,
-                boost_float,
-                handbrake_float,
-            ) = engine_action[idx]
-            self._future_tick_action_map[start_tick + idx] = flat.ControllerState(
-                throttle=throttle,
-                steer=steer,
-                pitch=pitch,
-                yaw=yaw,
-                roll=roll,
-                jump=jump_float > 0,
-                boost=boost_float > 0,
-                handbrake=handbrake_float > 0,
-                use_item=False,
-            )
+        if clear_hist:
+            self._future_tick_action_map = {
+                tick: action
+                for (tick, action) in self._future_tick_action_map.items()
+                if tick
+                >= self._last_env_action_start_tick
+                + min(
+                    0, self.config.action_step_idx_used_to_build_game_state_for_env_step
+                )
+            }
+        action = self.get_action(obs[self.player_id], game_state, packet)
+        if isinstance(action, List):
+            self._last_engine_action_length = len(action)
+            controller_states = action
+        else:
+            engine_action = self.action_parser.parse_actions(
+                {self.player_id: action}, self.latest_game_state, self.shared_info
+            )[self.player_id]
+            steps = engine_action.shape[0]
+            self._last_engine_action_length = steps
+            controller_states = []
+            for idx in range(steps):
+                (
+                    throttle,
+                    steer,
+                    pitch,
+                    yaw,
+                    roll,
+                    jump_float,
+                    boost_float,
+                    handbrake_float,
+                ) = engine_action[idx]
+                controller_states.append(
+                    flat.ControllerState(
+                        throttle=throttle,
+                        steer=steer,
+                        pitch=pitch,
+                        yaw=yaw,
+                        roll=roll,
+                        jump=jump_float > 0,
+                        boost=boost_float > 0,
+                        handbrake=handbrake_float > 0,
+                        use_item=False,
+                    )
+                )
+        for idx, controller_state in enumerate(controller_states):
+            self._future_tick_action_map[start_tick + idx] = controller_state
 
     @staticmethod
     def _get_agents_list(game_state: GameState):
-        # TODO: maybe agents should only be this agent
         return list(game_state.cars.keys())
 
-    def _update_game_state_ball_touches(self, reset_tick: int):
+    def _update_gamestate_ball_touches(self, reset_tick: int):
         assert (
             reset_tick in self._hist_game_states_and_packets
         ), f"Ball touches reset failed - reset requested starting from tick {reset_tick} but there is no game state that was created on this tick and so we can't identify the number of touches to subtract for each player"
@@ -322,7 +344,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                 # TODO: set state
                 pass
         game_state = deepcopy(game_state)
-        self._update_game_state_ball_touches(start_tick)
+        self._update_gamestate_ball_touches(game_state.tick_count)
         agents = RLGymBot._get_agents_list(game_state)
         if self.shared_info_provider is not None:
             self.shared_info = self.shared_info_provider.set_state(
@@ -341,7 +363,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
     def _env_step(self, game_state: GameState, start_tick: int):
         self._last_env_action_start_tick = start_tick
         game_state = deepcopy(game_state)
-        self._update_game_state_ball_touches(start_tick)
+        self._update_gamestate_ball_touches(game_state.tick_count)
         agents = RLGymBot._get_agents_list(game_state)
         if self.shared_info_provider is not None:
             self.shared_info = self.shared_info_provider.step(
@@ -370,15 +392,11 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         return obs, is_terminated, is_truncated
 
     def _handle_packet(self, packet: flat.GamePacket):
-        # Other match phases don't have a ball and will break things if we try to update the game state, so we may as well ignore them everywhere
-        if packet.match_info.match_phase in [
-            flat.MatchPhase.Countdown,
-            flat.MatchPhase.Kickoff,
-            flat.MatchPhase.Active,
-        ]:
-            self._unused_packets.append(packet)
+        self._unused_packets.append(packet)
 
-    def _update_gamestate_using_packets(self, packets: List[flat.GamePacket]):
+    def _update_gamestate_using_packets(
+        self, packets: List[flat.GamePacket], clean_hist=True
+    ):
         # We assume the packets here are only going to be match phase of countdown, kickoff, or active
         for packet in packets:
             extra_info = None
@@ -389,11 +407,12 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                 deepcopy(self.latest_game_state),
                 packet,
             )
-        self._hist_game_states_and_packets = {
-            tick: gsp
-            for tick, gsp in self._hist_game_states_and_packets.items()
-            if tick >= self._last_env_action_start_tick
-        }
+        if clean_hist:
+            self._hist_game_states_and_packets = {
+                tick: gsp
+                for tick, gsp in self._hist_game_states_and_packets.items()
+                if tick >= self._last_env_action_start_tick
+            }
 
     # We last sent an action on some tick, and more than one tick has passed since then. That's ok if the action we sent is the one we were going to send anyway for the ticks since.
     # This method checks to see if that's indeed the case or not
@@ -402,28 +421,56 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         correct = False
         if cur_tick in self._future_tick_action_map:
             # If cur_tick is in self._future_tick_action_map, we only need to reset if the action we have taken since then up to the current tick is not equal to
-            # self._future_tick_action_map[self._last_sent_action_tick]
+            # self._last_sent_action
             correct = True
-            last_sent_action_pack = self._future_tick_action_map[
-                self._last_sent_action_tick
-            ].pack()
+            # TODO: switch back to .pack() once Virx adds the functionality back
+            last_sent_action_pack = repr(self._last_sent_action)
             idx = self._last_sent_action_tick
             while correct and idx < cur_tick:
                 idx += 1
-                if self._future_tick_action_map[idx].pack() != last_sent_action_pack:
+                # TODO: here too
+                if repr(self._future_tick_action_map[idx]) != last_sent_action_pack:
                     correct = False
         return correct
 
-    def _env_reset_and_update_action_map(
-        self, packet: flat.GamePacket, start_tick: bool, set_state: bool = False
+    # Handle env resets when they need to happen but we don't necessarily have all the information to do it normally.
+    def _unexpected_env_reset_and_update_action_map(
+        self, desired_reset_tick, desired_submit_first_action_tick
     ):
-        obs = self._env_reset(self.latest_game_state, start_tick, set_state=False)
-        self._update_future_tick_action_map(packet, obs, start_tick)
+        cur_tick = self._unused_packets[-1].match_info.frame_num
+        nearest_hist_tick_to_desired_reset_tick = min(
+            self._hist_game_states_and_packets,
+            key=lambda v: abs(v - desired_reset_tick),
+        )
+        (nearest_game_state, nearest_packet) = self._hist_game_states_and_packets[
+            nearest_hist_tick_to_desired_reset_tick
+        ]
+
+        self._env_reset_and_update_action_map(
+            packet=nearest_packet,
+            game_state=nearest_game_state,
+            start_tick=desired_submit_first_action_tick,
+        )
+        if cur_tick not in self._future_tick_action_map:
+            # If the action is only for one tick and not self.config.above_240_fps_mode, it will put it for the previous tick instead of the current tick, which is not workable.
+            # If it's more than one tick, starting using the second tick is desirable
+            self._future_tick_action_map[cur_tick] = self._future_tick_action_map[
+                desired_submit_first_action_tick
+            ]
+
+    def _env_reset_and_update_action_map(
+        self,
+        packet: flat.GamePacket,
+        game_state: GameState,
+        start_tick: bool,
+    ):
+        obs = self._env_reset(game_state, start_tick, set_state=False)
+        self._update_future_tick_action_map(packet, game_state, obs, start_tick)
         if self.config.action_step_idx_used_to_build_game_state_for_env_step == 0:
             # We calculate the update to the obs etc using the same state as the reset and use this to produce the actions to be used after the reset's obs' actions
-            (obs, *_) = self._env_step(self.latest_game_state, start_tick)
+            (obs, *_) = self._env_step(game_state, start_tick)
             self._update_future_tick_action_map(
-                packet, obs, max(self._future_tick_action_map.keys()) + 1
+                packet, game_state, obs, max(self._future_tick_action_map.keys()) + 1
             )
 
     # Update the future tick action map and internal state based on the unused packets we have collected since the last time this method was called
@@ -440,11 +487,14 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                 self._match_first_countdown = False
 
             # If we just received a countdown packet for the first time since the last countdown, store the first countdown packet's frame num for use later
-            if self._last_packet in [
-                None,
-                flat.MatchPhase.GoalScored,
-                flat.MatchPhase.Replay,
-            ] and any(
+            if (
+                self._last_packet is None
+                or self._last_packet.match_info.match_phase
+                in [
+                    flat.MatchPhase.GoalScored,
+                    flat.MatchPhase.Replay,
+                ]
+            ) and any(
                 [
                     p.match_info.match_phase == flat.MatchPhase.Countdown
                     for p in self._unused_packets
@@ -455,8 +505,11 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                     for p in self._unused_packets
                     if p.match_info.match_phase == flat.MatchPhase.Countdown
                 )
+                self._set_first_action = False
+                self._early_countdown_finish_adjustment_possible = True
 
             latest_packet = self._unused_packets[-1]
+            cur_tick = latest_packet.match_info.frame_num
 
             # If the latest packet is not one of Countdown, Kickoff, or Active, delegate to self.get_other_packet_output
             if latest_packet.match_info.match_phase not in [
@@ -471,67 +524,144 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                 )
                 return
 
-            # TODO: update this for self.above_240_fps_mode = True
             # If the latest packet is countdown, update the game state using all the packets sequentially and then handle the latest packet, and then we're done
             if latest_packet.match_info.match_phase == flat.MatchPhase.Countdown:
-                cur_tick = latest_packet.match_info.frame_num
+                self._last_seen_countdown_tick = cur_tick
                 # Actually, if this isn't the first kickoff, we can do a little better by assuming we caught the first tick of countdown and countdown lasts for 480 ticks:
                 # In that case, we can predict when we are on the last tick of countdown and when this happens we actually don't want to update the future tick action map - we want to leave the
                 # actions in place from the previous packet so that we are aligned properly. Of course, we only want to do this if 240 fps mode is disabled, because in that case we
                 # want to use the last tick of countdown to reset and determine actions.
-                if (
-                    not self.config.above_240_fps_mode
-                    and not self._match_first_countdown
-                    and cur_tick - self._first_countdown_tick >= 479
-                ):
-                    # We currently are processing what is expected to be the last countdown packet. We therefore want to reset using the second to last packet,
-                    # which we might've already handled on a previous invocation. If we have, just update the game state and return - the future tick action map is
-                    # already populated. If not, reset using the second to last packet. This upcoming action (the one which is too late to control when not in
-                    # 240 fps mode) will be a previous tick's first action which is fine, but we really want to use the second action now.
-                    n_packets = len(self._unused_packets)
-                    if n_packets > 1:
-                        self._update_gamestate_using_packets(self._unused_packets[:-1])
-                        # Setting cur_tick=cur_tick-1 means that the action will have "started" a tick ago from the perspective of the rest of the code, so the action we
-                        # take starting now will be the second action as desired. Note that this really is what we desire because we are definitely still in countdown as of the latest packet.
-                        self._env_reset_and_update_action_map(
-                            packet=self._unused_packets[-2],
-                            start_tick=cur_tick - 1,
-                            set_state=False,
-                        )
-                        self._update_gamestate_using_packets([self._unused_packets[-1]])
-                    else:
+                # cur_tick - self._first_countdown_tick == 479 => last countdown packet => want to reset using:
+                #  0 case: last tick of countdown (in above 240fps mode) submitting first action on last tick of countdown, 2nd to last tick of countdown (in 120fps mode) submitting first action on 2nd to last tick of countdown
+                #  1 case: last tick of countdown (in above 240fps mode) submitting first action on last tick of countdown, 2nd to last tick of countdown (in 120fps mode) submitting first action on 2nd to last tick of countdown
+                #  -1 case: last tick of countdown (in above 240fps mode) submitting first action on last tick of countdown
+                #  -2 case: 2nd to last tick of countdown (in above 240fps mode) submitting first action on last tick of countdown, 2nd to last tick of countdown (in 120fps mode) submitting first action on 2nd to last tick of countdown
+                #  -3 case: 3rd to last tick of countdown (in above 240fps mode) submitting first action on last tick of countdown, 3rd to last tick of countdown (in 120fps mode) submitting first action on 2nd to last tick of countdown
+                if not self._match_first_countdown:
+                    last_countdown_tick = (
+                        cur_tick
+                        if cur_tick - self._first_countdown_tick
+                        >= USUAL_COUNTDOWN_LENGTH_TICKS - 1
+                        else USUAL_COUNTDOWN_LENGTH_TICKS
+                        - 1
+                        + self._first_countdown_tick
+                    )
+                    desired_last_reset_tick = (
+                        last_countdown_tick - (not self.config.above_240_fps_mode)
+                        if self.config.action_step_idx_used_to_build_game_state_for_env_step
+                        >= -1
+                        else last_countdown_tick
+                        + self.config.action_step_idx_used_to_build_game_state_for_env_step
+                        + 1
+                    )
+                    desired_submit_first_action_tick = last_countdown_tick - (
+                        not self.config.above_240_fps_mode
+                    )
+                    if cur_tick < desired_last_reset_tick:
+                        # Update the game state using all the packets sequentially and then reset using the latest packet. Let's just say we plan to start the action this tick so that something is submitted for later
                         self._update_gamestate_using_packets(self._unused_packets)
+                        self._env_reset_and_update_action_map(
+                            packet=latest_packet,
+                            game_state=self.latest_game_state,
+                            start_tick=cur_tick,
+                        )
+                        return
+                    # cur_tick >= desired_last_reset_tick and so if self._set_first_action is false we need to find the nearest packet tick and use that to reset
+                    if not self._set_first_action:
+                        packet_ticks = [
+                            p.match_info.frame_num for p in self._unused_packets
+                        ]
+                        nearest_packet_tick = min(
+                            packet_ticks, key=lambda v: abs(v - desired_last_reset_tick)
+                        )
+                        # Update the game state using all the packets up through the one we want to reset on, and then reset using that packet (starting the action in the action map on desired_submit_first_action_tick)
+                        last_reset_packet_idx = packet_ticks.index(nearest_packet_tick)
+                        self._update_gamestate_using_packets(
+                            self._unused_packets[: last_reset_packet_idx + 1]
+                        )
+                        self._env_reset_and_update_action_map(
+                            packet=self._unused_packets[last_reset_packet_idx],
+                            game_state=self.latest_game_state,
+                            start_tick=desired_submit_first_action_tick,
+                        )
+                        self._update_gamestate_using_packets(
+                            self._unused_packets[last_reset_packet_idx + 1 :],
+                            clean_hist=False,
+                        )
+                        # Just in case the last countdown tick is one tick closer than we expected, have this pre-fired
+                        self._future_tick_action_map[cur_tick] = (
+                            self._future_tick_action_map[
+                                desired_submit_first_action_tick
+                            ]
+                        )
+                        self._set_first_action = True
+                        return
+                    # At this point we've done all we can do, EXCEPT in the edge case that kickoff is one tick later than we expected and we are in this block having already set the first action
+                    if (
+                        last_countdown_tick
+                        > USUAL_COUNTDOWN_LENGTH_TICKS - 1 + self._first_countdown_tick
+                    ):
+                        # Just move everything down by len(self._unused_packets)
+                        self._future_tick_action_map = {
+                            (k + len(self._unused_packets)): v
+                            for (k, v) in self._future_tick_action_map.items()
+                        }
                     return
-
-                self._update_gamestate_using_packets(self._unused_packets)
-                # Get new action based on the latest packet and set future tick action map accordingly. We want to start moving between the last tick of countdown and
-                # the first tick of kickoff, before we even know it's kickoff in this code
-                self._env_reset_and_update_action_map(
-                    packet=self._unused_packets[-1],
-                    start_tick=cur_tick,
-                    set_state=False,
+                # For first kickoff, we don't know when it will end so we have to assume every latest packet is the last countdown tick
+                self._update_gamestate_using_packets(
+                    self._unused_packets, clean_hist=False
                 )
-                self._just_handled_countdown_packet = True
+                desired_reset_tick = (
+                    cur_tick - (not self.config.above_240_fps_mode)
+                    if self.config.action_step_idx_used_to_build_game_state_for_env_step
+                    >= -1
+                    else cur_tick
+                    + self.config.action_step_idx_used_to_build_game_state_for_env_step
+                    + 1
+                )
+                desired_submit_first_action_tick = cur_tick - (
+                    not self.config.above_240_fps_mode
+                )
+                self._unexpected_env_reset_and_update_action_map(
+                    desired_reset_tick, desired_submit_first_action_tick
+                )
                 return
-            cur_tick = latest_packet.match_info.frame_num
             if (
                 self._unused_packets[0].match_info.match_phase
                 == flat.MatchPhase.Countdown
             ):
-                # TODO: update this for self.above_240_fps_mode = True
+                self._last_seen_countdown_tick = next(
+                    p.match_info.frame_num
+                    for p in reversed(self._unused_packets)
+                    if p.match_info.match_phase == flat.MatchPhase.Countdown
+                )
                 # We have some positive number of countdown packets and some positive number of live game packets (either kickoff or active, but probably kickoff unless something crazy has happened).
                 if not self._check_last_sent_action_correct_for_ticks_since():
                     # On a previous tick, we took an action we did not expect to have taken initially. Let's reset and start fresh, and then we're done.
                     # I'm not going to use MissedActionRecoveryStyle here because this is an edge case where resetting should always be preferable.
-                    self._update_gamestate_using_packets(self._unused_packets)
-                    self._env_reset_and_update_action_map(
-                        packet=self._unused_packets[-1],
-                        start_tick=cur_tick,
-                        set_state=False,
-                    )
+                    self._unexpected_env_reset_and_update_action_map(cur_tick, cur_tick)
                     return
                 # OK, at this point we are in the same situation we would be in if all the unused packets were live game ones, so let's handle both at once by finishing this if block here and continuing below
 
+            # If the countdown ended sooner than expected, move up the actions according to when countdown actually ended
+            if not self._match_first_kickoff:
+                self._match_first_kickoff = False
+                countdown_ticks_early = (
+                    USUAL_COUNTDOWN_LENGTH_TICKS
+                    - 1
+                    + self._first_countdown_tick
+                    - self._last_seen_countdown_tick
+                )
+                if (
+                    self._early_countdown_finish_adjustment_possible
+                    and countdown_ticks_early > 0
+                ):
+                    self._early_countdown_finish_adjustment_possible = False
+                    # Just move everything up by countdown_ticks_early
+                    self._future_tick_action_map = {
+                        (k - countdown_ticks_early): v
+                        for (k, v) in self._future_tick_action_map.items()
+                    }
             # We need to update the game state using all the ticks, but we want to grab the correct game state based on the action_step_idx_used_to_build_game_state_for_env_step config value
             # Let's first look at how this value works in RLGym v2, or more specifically how I would imagine it working if it existed.
             # For simplicity, let's say every action (by this I mean result from the action parser) has a shape of (4,8) i.e. it defines 4 ticks worth of env actions.
@@ -786,102 +916,117 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                     )
                     match self.config.missed_action_recovery_style:
                         case MissedActionRecoveryStyle.RESET:
-                            self._env_reset_and_update_action_map(
-                                packet=self._unused_packets[-1],
-                                start_tick=cur_tick,
-                                set_state=False,
+                            self._unexpected_env_reset_and_update_action_map(
+                                cur_tick, cur_tick
                             )
                             return
                         case MissedActionRecoveryStyle.IGNORE:
                             # Whatever I guess
                             pass
 
-            last_defined_action_tick = max(self._future_tick_action_map)
+            # Do the below loop while next_env_step_tick <= cur_tick
+            should_continue = True
+            while should_continue:
+                last_defined_action_tick = max(self._future_tick_action_map)
 
-            # We need to figure out the next tick on which we need to do an env step
-            if self.config.action_step_idx_used_to_build_game_state_for_env_step >= 0:
-                # What's the next tick t we would want to create an obs on? It's when self._last_engine_action_length + t - last_defined_action_tick = self.config.action_step_idx_used_to_build_game_state_for_env_step + 1 + (not self.config.above_240_fps_mode)
-                next_env_step_tick = (
+                # We need to figure out the next tick on which we need to do an env step
+                if (
                     self.config.action_step_idx_used_to_build_game_state_for_env_step
-                    + 1
-                    + (not self.config.above_240_fps_mode)
-                    + last_defined_action_tick
-                    - self._last_engine_action_length
-                )
-            else:
-                # last_defined_action_tick - t = 2 - self.config.action_step_idx_used_to_build_game_state_for_env_step - (not self.config.above_240_fps_mode)
-                next_env_step_tick = (
-                    last_defined_action_tick
-                    - 2
-                    + self.config.action_step_idx_used_to_build_game_state_for_env_step
-                    + (not self.config.above_240_fps_mode)
-                )
-            if next_env_step_tick < cur_tick:
-                # We were supposed to step the env in the past, which might be fine if we still have actions queued up or the action we've been taking is the intended one
-                # First, find the game state we should use to step
-                step_tick = None
-                if next_env_step_tick not in self._hist_game_states_and_packets:
-                    self.logger.warning(
-                        "missed step tick, recovering using missed step tick recovery style"
-                    )
-                    # We missed the tick we wanted to use in order to perform the step
-                    match self.config.missed_step_tick_recovery_style:
-                        case MissedStepTickRecoveryStyle.RESET:
-                            self._env_reset_and_update_action_map(
-                                packet=self._unused_packets[-1],
-                                start_tick=cur_tick,
-                                set_state=False,
-                            )
-                            return
-                        case MissedStepTickRecoveryStyle.USE_NEAREST:
-                            step_tick = min(
-                                self._hist_game_states_and_packets,
-                                key=lambda v: abs(v - next_env_step_tick),
-                            )
-                else:
-                    step_tick = next_env_step_tick
-                step_gs, step_packet = self._hist_game_states_and_packets[step_tick]
-
-                # Next see if we are still fine and handle the various scenarios
-                if last_defined_action_tick >= cur_tick:
-                    # OK, we can still catch up
-                    (obs, *_) = self._env_step(step_gs, step_tick)
-                    self._update_future_tick_action_map(
-                        step_packet,
-                        obs,
-                        max(self._future_tick_action_map.keys()) + 1,
+                    >= 0
+                ):
+                    # What's the next tick t we would want to create an obs on? It's when n-k=self.config.action_step_idx_used_to_build_game_state_for_env_step + 1 + (not self.config.above_240_fps_mode)
+                    # n = self._last_engine_action_length
+                    # k = last_defined_action_tick - t
+                    # so self._last_engine_action_length + t - last_defined_action_tick = self.config.action_step_idx_used_to_build_game_state_for_env_step + 1 + (not self.config.above_240_fps_mode)
+                    # so t = next_env_step_tick = ...
+                    next_env_step_tick = (
+                        self.config.action_step_idx_used_to_build_game_state_for_env_step
+                        + 1
+                        + (not self.config.above_240_fps_mode)
+                        + last_defined_action_tick
+                        - self._last_engine_action_length
                     )
                 else:
-                    # OK, we still might be fine if the action we have been taking is the intended one, so let's try to step and then see if what we planned aligns with what we actually did
-                    (obs, *_) = self._env_step(step_gs, step_tick)
-                    self._update_future_tick_action_map(
-                        step_packet,
-                        obs,
-                        max(self._future_tick_action_map.keys()) + 1,
+                    # Ditto? It's when k = -2 - self.config.action_step_idx_used_to_build_game_state_for_env_step - (not self.config.above_240_fps_mode)
+                    # k = last_defined_action_tick - t
+                    # so last_defined_action_tick - t = -2 - self.config.action_step_idx_used_to_build_game_state_for_env_step - (not self.config.above_240_fps_mode)
+                    # so t = next_env_step_tick = ...
+                    next_env_step_tick = (
+                        last_defined_action_tick
+                        + 2
+                        + self.config.action_step_idx_used_to_build_game_state_for_env_step
+                        + (not self.config.above_240_fps_mode)
                     )
-                    if not self._check_last_sent_action_correct_for_ticks_since():
+                if next_env_step_tick < cur_tick:
+                    # We were supposed to step the env in the past, which might be fine if we still have actions queued up or the action we've been taking is the intended one
+                    # First, find the game state we should use to step
+                    step_tick = None
+                    if next_env_step_tick not in self._hist_game_states_and_packets:
                         self.logger.warning(
-                            "missed action, recovering using missed action recovery style"
+                            "missed step tick %s, recovering using missed step tick recovery style",
+                            next_env_step_tick,
                         )
-                        match self.config.missed_action_recovery_style:
-                            case MissedActionRecoveryStyle.RESET:
-                                self._env_reset_and_update_action_map(
-                                    packet=self._unused_packets[-1],
-                                    start_tick=cur_tick,
-                                    set_state=False,
+                        # We missed the tick we wanted to use in order to perform the step
+                        match self.config.missed_step_tick_recovery_style:
+                            case MissedStepTickRecoveryStyle.RESET:
+                                self._unexpected_env_reset_and_update_action_map(
+                                    cur_tick, cur_tick
                                 )
-                                return
-                            case MissedActionRecoveryStyle.IGNORE:
-                                # Whatever I guess
-                                pass
-            else:
-                if next_env_step_tick == cur_tick:
-                    (obs, *_) = self._env_step(self.latest_game_state, cur_tick)
-                    self._update_future_tick_action_map(
-                        self._unused_packets[-1],
-                        obs,
-                        max(self._future_tick_action_map.keys()) + 1,
-                    )
+                                continue
+                            case MissedStepTickRecoveryStyle.USE_NEAREST:
+                                step_tick = min(
+                                    self._hist_game_states_and_packets,
+                                    key=lambda v: abs(v - next_env_step_tick),
+                                )
+                    else:
+                        step_tick = next_env_step_tick
+                    step_gs, step_packet = self._hist_game_states_and_packets[step_tick]
+
+                    # Next see if we are still fine and handle the various scenarios
+                    if last_defined_action_tick >= cur_tick:
+                        # OK, we can still catch up
+                        (obs, *_) = self._env_step(step_gs, step_tick)
+                        self._update_future_tick_action_map(
+                            step_packet,
+                            step_gs,
+                            obs,
+                            max(self._future_tick_action_map.keys()) + 1,
+                        )
+                    else:
+                        # OK, we still might be fine if the action we have been taking is the intended one, so let's try to step and then see if what we planned aligns with what we actually did
+                        (obs, *_) = self._env_step(step_gs, step_tick)
+                        # Pass clear_hist as false because the we are calling _check_last_sent_action_correct_for_ticks_since after calling _env_step
+                        self._update_future_tick_action_map(
+                            step_packet,
+                            step_gs,
+                            obs,
+                            max(self._future_tick_action_map.keys()) + 1,
+                            clear_hist=False,
+                        )
+                        if not self._check_last_sent_action_correct_for_ticks_since():
+                            self.logger.warning(
+                                "missed action, recovering using missed action recovery style"
+                            )
+                            match self.config.missed_action_recovery_style:
+                                case MissedActionRecoveryStyle.RESET:
+                                    self._unexpected_env_reset_and_update_action_map(
+                                        cur_tick, cur_tick
+                                    )
+                                    continue
+                                case MissedActionRecoveryStyle.IGNORE:
+                                    # Whatever I guess
+                                    pass
+                else:
+                    if next_env_step_tick == cur_tick:
+                        (obs, *_) = self._env_step(self.latest_game_state, cur_tick)
+                        self._update_future_tick_action_map(
+                            latest_packet,
+                            self.latest_game_state,
+                            obs,
+                            max(self._future_tick_action_map.keys()) + 1,
+                        )
+                    else:
+                        should_continue = False
 
         except Exception as e:
             self.logger.error(
@@ -910,12 +1055,24 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                         self._process_unused_packets()
                         self._last_packet = self._unused_packets[-1]
                         self._unused_packets.clear()
-                        controller_state = flat.ControllerState()
                         cur_tick = self._last_packet.match_info.frame_num
                         if cur_tick in self._future_tick_action_map:
-                            controller_state = self._future_tick_action_map[cur_tick]
+                            self._last_sent_action_tick = cur_tick
+                            self._last_sent_action = self._future_tick_action_map[
+                                cur_tick
+                            ]
+                        else:
+                            if self._last_packet.match_info.match_phase in [
+                                flat.MatchPhase.Countdown,
+                                flat.MatchPhase.Kickoff,
+                                flat.MatchPhase.Active,
+                            ]:
+                                self.logger.warning(
+                                    "No controller state set in self._future_tick_action_map for this tick (%d)!",
+                                    cur_tick,
+                                )
                         self._game_interface.send_msg(
-                            flat.PlayerInput(self.index, controller_state)
+                            flat.PlayerInput(self.index, self._last_sent_action)
                         )
                     block_next = True
                 case _:
@@ -1042,7 +1199,9 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         return flat.ControllerState()
 
     @abstractmethod
-    def get_action(self, obs: ObsType, packet: flat.GamePacket) -> ActionType:
+    def get_action(
+        self, obs: ObsType, game_state: GameState, packet: flat.GamePacket
+    ) -> Union[ActionType, List[flat.ControllerState]]:
         """
         Called to get action when the actions returned by the last call to the action parser with the last result from this function have all been used up.
         """

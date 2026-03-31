@@ -1,2 +1,6 @@
-from .actor import Actor
-from .rlgym_bot import RLGymBot
+from .rlgym_bot import (
+    RLGymBot,
+    RLGymBotConfig,
+    MissedActionRecoveryStyle,
+    MissedStepTickRecoveryStyle,
+)
