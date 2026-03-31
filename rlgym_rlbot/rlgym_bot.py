@@ -316,9 +316,11 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         return list(game_state.cars.keys())
 
     def _update_gamestate_ball_touches(self, reset_tick: int):
-        assert (
-            reset_tick in self._hist_game_states_and_packets
-        ), f"Ball touches reset failed - reset requested starting from tick {reset_tick} but there is no game state that was created on this tick and so we can't identify the number of touches to subtract for each player"
+        if reset_tick not in self._hist_game_states_and_packets:
+            self.logger.warning(
+                f"Ball touches reset failed - reset requested starting from tick {reset_tick} but there is no game state that was created on this tick and so we can't identify the number of touches to subtract for each player"
+            )
+            return
 
         gs, _ = self._hist_game_states_and_packets[reset_tick]
         n_touches_to_sub = {car_id: car.ball_touches for car_id, car in gs.cars.items()}
@@ -1203,6 +1205,6 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         self, obs: ObsType, game_state: GameState, packet: flat.GamePacket
     ) -> Union[ActionType, List[flat.ControllerState]]:
         """
-        Called to get action when the actions returned by the last call to the action parser with the last result from this function have all been used up.
+        Called to get the next ActionType to use with the action parser, or to get a list of ControllerStates if hard-coding inputs.
         """
         raise NotImplementedError
