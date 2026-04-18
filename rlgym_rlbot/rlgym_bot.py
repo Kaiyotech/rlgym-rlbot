@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from traceback import print_exc
-from typing import Any, Tuple, Dict, Generic, List, Optional, Union
+from typing import Any, Tuple, Dict, Generic, List, Optional, Union, Callable
 
 import numpy as np
 from rlbot import flat
@@ -23,6 +23,7 @@ from rlbot.utils.logging import DEFAULT_LOGGER, get_logger
 from rlgym.api import (
     ActionParser,
     ActionType,
+    AgentID,
     DoneCondition,
     ObsBuilder,
     ObsType,
@@ -35,8 +36,6 @@ from rlgym_compat import GameState
 from rlgym_compat.sim_extra_info import SimExtraInfo
 
 from .util import create_base_state
-
-AgentID = int
 
 USUAL_COUNTDOWN_LENGTH_TICKS = 480
 
@@ -52,7 +51,7 @@ class MissedStepTickRecoveryStyle(Enum):
 
 
 @dataclass
-class RLGymBotConfig:
+class RLGymBotConfig(Generic[AgentID]):
     above_240_fps_mode: bool = False
     action_step_idx_used_to_build_game_state_for_env_step: int = -2
     missed_action_recovery_style: MissedActionRecoveryStyle = (
@@ -63,9 +62,10 @@ class RLGymBotConfig:
     )
     standard_map: bool = True
     sim_extra_info: bool = False
+    agent_ids_fn: Optional[Callable[[flat.GamePacket], Dict[int, AgentID]]] = None
 
 
-class RLGymBot(Generic[ActionType, ObsType, RewardType]):
+class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
     """
     A convenience base class for bots developed using RLGym.
     The base class handles the setup and communication with the rlbot server, along with management of RLGym config objects.
@@ -119,7 +119,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         state_mutator: Optional[StateMutator[GameState]] = None,
         shared_info_provider: Optional[SharedInfoProvider[AgentID, GameState]] = None,
         default_agent_id: Optional[str] = None,
-        config=RLGymBotConfig(),
+        config: RLGymBotConfig[AgentID] = RLGymBotConfig(),
     ):
         # Long term, the below assertion is what we will use. It doesn't hurt to leave it uncommented along with the above.
         assert (
@@ -212,6 +212,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
             field_info=self.field_info,
             match_configuration=self.match_config,
             standard_map=self.config.standard_map,
+            agent_ids_fn=self.config.agent_ids_fn,
         )
         if self.config.sim_extra_info:
             self.sim_extra_info = SimExtraInfo(self.field_info, self.match_config)

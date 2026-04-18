@@ -142,6 +142,9 @@ Boolean - default `true`. This option is passed to [rlgym-compat](https://github
 ### sim_extra_info
 Boolean - default `false`. This option determines whether rlgym-compat's [SimExtraInfo](https://github.com/JPK314/rlgym-compat/blob/main/rlgym_compat/sim_extra_info.py) is used for extra information that otherwise cannot be derived from the RLBot GamePacket.
 
+### agent_ids_fn
+Optional Callable - default `None`. This option determines how rlgym-compat assigns `AgentID`s to players when creating the compat GameState from the RLBot v5's `flat.GamePacket`. The input is a `GamePacket` and the output is a map from `PlayerInfo.player_id` to your desired `AgentID` data type and value for your config objects. Normally this would be handled by your `StateMutator`, but that functionality is not implemented yet and this acts as a simple override without the other potential `StateMutator` behavior.
+
 
 ## What does "accurate" mean? What is this wrapper doing?
 This wrapper attempts to replicate the training conditions of your bot in RLGym as accurately as possible. This means a lot of consideration is put into tick-perfectly matching everything where possible.
