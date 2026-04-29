@@ -138,6 +138,8 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
         self.state_mutator = state_mutator
         self.shared_info_provider = shared_info_provider
         self.config = config
+        self.gamestate_converter = gamestate_converter
+        self.change_agent_id_to_string = change_agent_id_to_string
 
         self.received_first_packet = False
         self.shared_info = (
@@ -274,13 +276,23 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
                 )
             }
         action = self.get_action(obs[self.player_id], game_state, packet)
+
         if isinstance(action, List):
             self._last_engine_action_length = len(action)
             controller_states = action
         else:
+            engine_action = None
+            # convert if unconverted
+            if type(game_state) == GameState:
+                temp_game_state = deepcopy(game_state)
+                temp_game_state = self._update_gamestate_agents(temp_game_state)
+            else:
+                temp_game_state = game_state
             engine_action = self.action_parser.parse_actions(
-                {self.player_id: action}, game_state, self.shared_info
-            )[self.player_id]
+                {self.player_id: action}, self.gamestate_converter(temp_game_state), self.shared_info
+            )
+            engine_action = engine_action[self.player_id]
+
             steps = engine_action.shape[0]
             self._last_engine_action_length = steps
             controller_states = []
@@ -313,7 +325,14 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
 
     @staticmethod
     def _get_agents_list(game_state: GameState):
-        return list(game_state.cars.keys())
+        blue_idx = 0
+        orange_idx = 0
+        l = []
+        for c in game_state.cars.values():
+            team = "opti-blue" if c.team_num == 0 else "opti-orange"
+            idx = blue_idx if c.team_num == 0 else orange_idx
+            l.append(f"{team}-{idx}")
+        return l
 
     def _update_gamestate_ball_touches(self, reset_tick: int):
         if reset_tick not in self._hist_game_states_and_packets:
@@ -349,9 +368,11 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
             if set_state:
                 # TODO: set state
                 pass
-        game_state = deepcopy(game_state)
-        self._update_gamestate_ball_touches(game_state.tick_count)
         agents = RLGymBot._get_agents_list(game_state)
+        game_state = self._update_gamestate_agents(game_state)
+        self._update_gamestate_ball_touches(game_state.tick_count)
+        if type(game_state) == GameState:
+            game_state = self.gamestate_converter(game_state)
         if self.shared_info_provider is not None:
             self.shared_info = self.shared_info_provider.set_state(
                 agents, game_state, self.shared_info
@@ -378,6 +399,15 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
         game_state = deepcopy(game_state)
         self._update_gamestate_ball_touches(game_state.tick_count)
         agents = RLGymBot._get_agents_list(game_state)
+
+        self._update_gamestate_ball_touches(game_state.tick_count)
+        if self.gamestate_converter is not None:
+            if self.change_agent_id_to_string:
+                game_state = self._update_gamestate_agents(game_state)
+            game_state = self.gamestate_converter(game_state)
+        else:
+            game_state = deepcopy(game_state)
+        
         if self.shared_info_provider is not None:
             self.shared_info = self.shared_info_provider.step(
                 agents, game_state, self.shared_info
@@ -486,6 +516,27 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
             self._env_step(
                 packet, game_state, max(self._future_tick_action_map.keys()) + 1
             )
+
+    def _update_gamestate_agents(
+        self,
+        game_state: GameState,
+    ) -> GameState:
+        blue_idx = 0
+        orange_idx = 0
+        new_cars = {}
+        for key, car in game_state.cars.items():
+            team = "opti-blue" if car.team_num == 0 else "opti-orange"
+            idx = blue_idx if car.team_num == 0 else orange_idx
+            new_id = f"{team}-{idx}"
+            if key == self.player_id:
+                self.player_id = new_id
+            new_cars[new_id] = car
+            if car.team_num == 0:
+                blue_idx += 1
+            else:
+                orange_idx += 1
+        game_state.cars = new_cars
+        return game_state
 
     # Update the future tick action map and internal state based on the unused packets we have collected since the last time this method was called
     def _process_unused_packets(self):
