@@ -20,7 +20,7 @@ license-files = [
 dependencies = [
     "rlbot == 2.0.0b52",
     "rlgym[api] >= 2.0.1",
-    "rlgym-compat @ git+https://github.com/JPK314/rlgym-compat.git@f57dff3"
+    "rlgym-compat @ git+https://github.com/JPK314/rlgym-compat.git@50b70c8"
 ]
 keywords=[
     "rocket-league",

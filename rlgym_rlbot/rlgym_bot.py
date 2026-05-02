@@ -273,14 +273,18 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
                     0, self.config.action_step_idx_used_to_build_game_state_for_env_step
                 )
             }
-        action = self.get_action(obs[self.player_id], game_state, packet)
+        if self.config.agent_ids_fn is not None:
+            agent_id = self.config.agent_ids_fn(packet)[self.player_id]
+        else:
+            agent_id = self.player_id
+        action = self.get_action(obs[agent_id], game_state, packet)
         if isinstance(action, List):
             self._last_engine_action_length = len(action)
             controller_states = action
         else:
             engine_action = self.action_parser.parse_actions(
-                {self.player_id: action}, game_state, self.shared_info
-            )[self.player_id]
+                {agent_id: action}, game_state, self.shared_info
+            )[agent_id]
             steps = engine_action.shape[0]
             self._last_engine_action_length = steps
             controller_states = []
