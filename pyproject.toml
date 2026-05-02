@@ -33,7 +33,7 @@ keywords=[
 ]
 
 [project.optional-dependencies]
-rocketsim = ["rocketsim >= 2.1"]
+rocketsim = ["rocketsim >= 2.2.1"]
 
 
 [project.urls]
