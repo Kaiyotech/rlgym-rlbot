@@ -19,6 +19,7 @@ license-files = [
 ]
 dependencies = [
     "rlbot == 2.0.0b52",
+    "rlbot_flatbuffers >= 0.18.8",
     "rlgym[api] >= 2.0.1",
     "rlgym-compat @ git+https://github.com/JPK314/rlgym-compat.git@f57dff3"
 ]
