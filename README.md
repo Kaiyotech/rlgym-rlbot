@@ -90,13 +90,13 @@ A value of 1 would look like the below - in particular, an action is decided usi
 A value of -1 would look like the below - in particular, the next action action is decided using the state after the last action's env action ticks are done:
 ```
 .-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-|| | | ||| | ||| | | ||└Action 3 tick 4, etc
-|| | | ||| | ||| | | |└Obs 4 created using this state, action 4 decided using obs 4
-|| | | ||| | ||| | | └Action 3 tick 3
-|| | | ||| | ||| | └Action 3 tick 2
-|| | | ||| | ||| └Action 3 tick 1
-|| | | ||| | ||└Action 2 tick 4
-|| | | ||| | |└Obs 3 created using this state, action 3 decided using obs 3
+|| | | ||| | | ||| | | |└Obs 4 created using this state, action 4 decided using obs 4, etc
+|| | | ||| | | ||| | | └Action 3 tick 4
+|| | | ||| | | ||| | └Action 3 tick 3
+|| | | ||| | | ||| └Action 3 tick 2
+|| | | ||| | | ||└Action 3 tick 1 
+|| | | ||| | | |└Obs 3 created using this state, action 3 decided using obs 3
+|| | | ||| | | └Action 2 tick 4
 || | | ||| | └Action 2 tick 3
 || | | ||| └Action 2 tick 2
 || | | ||└Action 2 tick 1
