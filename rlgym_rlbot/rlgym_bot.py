@@ -5,6 +5,7 @@ from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from time import perf_counter_ns
 from traceback import print_exc
 from typing import Any, Tuple, Dict, Generic, List, Optional, Union, Callable
 
@@ -71,13 +72,6 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
     """
     A convenience base class for bots developed using RLGym.
     The base class handles the setup and communication with the rlbot server, along with management of RLGym config objects.
-    Subclass from this to override the following methods:
-    - initialize
-    - retire
-    - handle_reward
-    - get_action
-    - handle_match_comm
-
     """
 
     logger = DEFAULT_LOGGER
@@ -473,10 +467,13 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
         return wrong_tick_action_map
 
     # Handle env resets when they need to happen but we don't necessarily have all the information to do it normally.
-    def _unexpected_env_reset_and_update_action_map(
-        self, desired_reset_tick, desired_submit_first_action_tick
-    ):
+    def _unexpected_env_reset(self):
         cur_tick = self._unused_packets[-1].match_info.frame_num
+        desired_reset_tick = (
+            cur_tick
+            + (self.config.step_offset.relative_to == StepOffsetRelativeTo.ACTION_END)
+            * self.config.step_offset.offset
+        )
         nearest_hist_tick_to_desired_reset_tick = min(
             self._hist_game_states_and_packets,
             key=lambda v: abs(v - desired_reset_tick),
@@ -488,14 +485,8 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
         self._env_reset_and_maybe_step(
             packet=nearest_packet,
             game_state=nearest_game_state,
-            start_tick=desired_submit_first_action_tick,
+            start_tick=cur_tick,
         )
-        if cur_tick not in self._tick_action_map:
-            # If the action is only for one tick and not self.config.above_240_fps_mode, it will put it for the previous tick instead of the current tick, which is not workable.
-            # If it's more than one tick, starting using the second tick is desirable
-            self._tick_action_map[cur_tick] = self._tick_action_map[
-                desired_submit_first_action_tick
-            ]
 
     def _env_reset_and_maybe_step(
         self,
@@ -510,6 +501,19 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
         ):
             # We calculate the update to the obs etc using the same state as the reset and use this to produce the actions to be used after the reset's obs' actions
             self._env_step(packet, game_state, max(self._tick_action_map.keys()) + 1)
+
+    def _get_ticks_left_in_current_action(self) -> int:
+        cur_tick = self._unused_packets[-1].match_info.frame_num
+        future_action_start_ticks = [
+            v for v in self._action_boundaries if v >= cur_tick
+        ]
+        if len(future_action_start_ticks) == 0:
+            next_action_start_tick = (
+                max(self._action_boundaries) + self._latest_engine_action_length
+            )
+        else:
+            next_action_start_tick = min(future_action_start_ticks)
+        return max(next_action_start_tick - cur_tick, 0)
 
     def _handle_possible_hardcoded_action(self) -> bool:
         latest_packet = self._unused_packets[-1]
@@ -526,15 +530,12 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
             # Take hard coded action
             self._last_sent_action_hardcoded = True
             self._tick_action_map.clear()
-            self._tick_action_map[self._unused_packets[-1].match_info.frame_num] = (
-                action
-            )
+            self._tick_action_map[cur_tick] = action
         else:
             if self._last_sent_action_hardcoded:
                 # Reset env on current tick
                 self._tick_action_map.clear()
-                game_state, packet = self._hist_game_states_and_packets[cur_tick]
-                self._env_reset_and_maybe_step(game_state, packet, cur_tick)
+                self._unexpected_env_reset()
             self._last_sent_action_hardcoded = False
         return self._last_sent_action_hardcoded
 
@@ -565,7 +566,6 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
 
             latest_packet = self._unused_packets[-1]
             cur_tick = latest_packet.match_info.frame_num
-
             # If the latest packet is not one of Countdown, Kickoff, or Active, delegate to self.get_other_packet_output
             if latest_packet.match_info.match_phase not in [
                 flat.MatchPhase.Countdown,
@@ -604,6 +604,10 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
                         }
                 return
 
+            used_hardcoded_action = self._handle_possible_hardcoded_action()
+            if used_hardcoded_action:
+                return
+
             # We might need to reset if we detect that we have done an incorrect action for any tick we are processing
             if (
                 len(self._unused_packets) > 1
@@ -614,19 +618,15 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
                 if len(wrong_tick_action_map) > 0:
                     self.logger.warning("Took incorrect action on a previous tick")
                     (cur_gs, cur_packet) = self._hist_game_states_and_packets[cur_tick]
-                    next_action_start_tick = min(
-                        v for v in self._action_boundaries if v >= cur_tick
-                    )
+                    ticks_left_in_action = self._get_ticks_left_in_current_action()
                     match self.decide_missed_action_recovery_style(
                         cur_gs,
                         cur_packet,
-                        next_action_start_tick - cur_tick,
+                        ticks_left_in_action,
                         wrong_tick_action_map,
                     ):
                         case MissedActionRecoveryStyle.RESET:
-                            self._unexpected_env_reset_and_update_action_map(
-                                cur_tick, cur_tick
-                            )
+                            self._unexpected_env_reset()
                             return
                         case MissedActionRecoveryStyle.IGNORE:
                             # Whatever I guess
@@ -659,19 +659,15 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
                         (cur_gs, cur_packet) = self._hist_game_states_and_packets[
                             cur_tick
                         ]
-                        next_action_start_tick = min(
-                            v for v in self._action_boundaries if v >= cur_tick
-                        )
+                        ticks_left_in_action = self._get_ticks_left_in_current_action()
                         match self.decide_missed_step_tick_recovery_style(
                             cur_gs,
                             cur_packet,
-                            next_action_start_tick - cur_tick,
+                            ticks_left_in_action,
                             self._last_sent_action,
                         ):
                             case MissedStepTickRecoveryStyle.RESET:
-                                self._unexpected_env_reset_and_update_action_map(
-                                    cur_tick, cur_tick
-                                )
+                                self._unexpected_env_reset()
                                 continue
                             case MissedStepTickRecoveryStyle.USE_NEAREST:
                                 step_tick = min(
@@ -703,19 +699,17 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
                             (cur_gs, cur_packet) = self._hist_game_states_and_packets[
                                 cur_tick
                             ]
-                            next_action_start_tick = min(
-                                v for v in self._action_boundaries if v >= cur_tick
+                            ticks_left_in_action = (
+                                self._get_ticks_left_in_current_action()
                             )
                             match self.decide_missed_action_recovery_style(
                                 cur_gs,
                                 cur_packet,
-                                next_action_start_tick - cur_tick,
+                                ticks_left_in_action,
                                 wrong_tick_action_map,
                             ):
                                 case MissedActionRecoveryStyle.RESET:
-                                    self._unexpected_env_reset_and_update_action_map(
-                                        cur_tick, cur_tick
-                                    )
+                                    self._unexpected_env_reset()
                                     return
                                 case MissedActionRecoveryStyle.IGNORE:
                                     # Whatever I guess
@@ -752,6 +746,7 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
                     running = False
                 case MsgHandlingResult.NO_INCOMING_MSGS:
                     if len(self._unused_packets) > 0:
+                        start_time = perf_counter_ns()
                         self._process_unused_packets()
                         self._last_packet = self._unused_packets[-1]
                         self._unused_packets.clear()
@@ -769,6 +764,12 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
                                     "No controller state set in self._tick_action_map for this tick (%d)!",
                                     cur_tick,
                                 )
+                        end_time = perf_counter_ns()
+                        used_time = (end_time - start_time) * 1e-6
+                        if used_time > 6:
+                            self.logger.warning(
+                                f"Determining the action for this tick took more than 6ms ({used_time:.2f} ms), and so this tick's action may not have been used on the desired tick."
+                            )
                         self._game_interface.send_msg(
                             flat.PlayerInput(self.index, self._last_sent_action)
                         )
@@ -948,8 +949,18 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
             int, Tuple[flat.ControllerState, Optional[flat.ControllerState]]
         ],
     ) -> MissedActionRecoveryStyle:
-        """Determines how detected missed actions (the wrong action was taken for a tick) are handled."""
-        # TODO: finish documentation and make implementation more clever (are we in the middle of an action? A flip?)
+        """Determines how detected missed actions (the wrong action was taken for a tick) are handled.
+
+        Args:
+            game_state: The GameState calculated from the latest flat.GamePacket received.
+            packet: The latest flat.GamePacket received.
+            ticks_left_in_action: The number of ticks (>= 0) left in the sequence of EngineActions returned by the most recent call to the
+                ActionParser instance, or 0 if there has not been a call to the ActionParser since the simulated RLGym v2 env's last reset call, or if this method returned a non-None value last tick.
+            wrong_tick_action_map: A dict where a key is a tick and the value for that key is a pair where the first element in the pair is the ControllerState used on that tick, and
+                the second element is the ControllerState that should've been used on that tick (or None if no action was defined for that tick due to some ticks getting skipped)
+        Returns:
+            MissedActionRecoveryStyle to either ignore the fact that incorrect actions were used or perform an on-the-fly simulated reset of the environment.
+        """
         return MissedActionRecoveryStyle.IGNORE
 
     def decide_missed_step_tick_recovery_style(
@@ -958,7 +969,16 @@ class RLGymBot(Generic[AgentID, ActionType, ObsType, RewardType]):
         packet: flat.GamePacket,
         ticks_left_in_action: int,
         last_action: flat.ControllerState,
-    ) -> MissedActionRecoveryStyle:
-        """Determines how a detected missed step tick (the tick needed for the game state to be used for the calls to the config objects for this step) are handled."""
-        # TODO: finish documentation and make implementation more clever (are we in the middle of an action? A flip?)
+    ) -> MissedStepTickRecoveryStyle:
+        """Determines how a detected missed step tick (the tick needed for the game state to be used for the calls to the config objects for this step) are handled.
+
+        Args:
+            game_state: The GameState calculated from the latest flat.GamePacket received.
+            packet: The latest flat.GamePacket received.
+            ticks_left_in_action: The number of ticks (>= 0) left in the sequence of EngineActions (ControllerStates) returned by the most recent call to the
+                ActionParser instance, or 0 if there has not been a call to the ActionParser since the simulated RLGym v2 env's last reset call, or if this method returned a non-None value last tick.
+            last_action: The last ControllerState used by the bot.
+        Returns:
+            MissedActionRecoveryStyle to either ignore the fact that incorrect actions were used or perform an on-the-fly simulated reset of the environment.
+        """
         return MissedStepTickRecoveryStyle.USE_NEAREST
