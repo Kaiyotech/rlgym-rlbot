@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rlgym-rlbot"
-version = "0.2.2"
+version = "0.3.0"
 requires-python = ">=3.8,<3.13"
 authors = [
     { name = "Jonathan Keegan" }
@@ -19,8 +19,9 @@ license-files = [
 ]
 dependencies = [
     "rlbot == 2.0.0b52",
+    "rlbot_flatbuffers >= 0.18.8",
     "rlgym[api] >= 2.0.1",
-    "rlgym-compat @ git+https://github.com/JPK314/rlgym-compat.git@f57dff3"
+    "rlgym-compat @ git+https://github.com/JPK314/rlgym-compat.git@50b70c8"
 ]
 keywords=[
     "rocket-league",
@@ -32,7 +33,7 @@ keywords=[
 ]
 
 [project.optional-dependencies]
-rocketsim = ["rocketsim >= 2.1"]
+rocketsim = ["rocketsim >= 2.2.1"]
 
 
 [project.urls]
